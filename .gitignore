@@ -1,0 +1,9 @@
+*
+!*/
+!.gitignore
+!main.py
+!texture.jpg
+!cropped_1.ply
+!cropped_2.ply
+!Models/coffee_machine-digital-with_joints.obj
+!Models/coffee_machine-scanned_result-iphone/coffee_machine-scanned_result-iphone.obj
