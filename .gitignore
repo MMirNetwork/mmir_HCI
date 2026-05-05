@@ -2,6 +2,7 @@
 !*/
 !.gitignore
 !main.py
+!requirements.txt
 !texture.jpg
 !cropped_1.ply
 !cropped_2.ply

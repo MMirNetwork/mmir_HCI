@@ -1,0 +1,5 @@
+open3d
+numpy
+Pillow
+xatlas
+opencv-python
