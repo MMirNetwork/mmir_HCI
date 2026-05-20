@@ -1,8 +1,66 @@
+import os, zipfile, tempfile, glob, json
 import open3d as o3d
 import copy
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 import xatlas
+
+def load_mesh(path):
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".obj":
+        return o3d.io.read_triangle_mesh(path, enable_post_processing=True)
+    elif ext in (".glb", ".gltf"):
+        import trimesh
+        raw = trimesh.load(path)
+        tm = trimesh.util.concatenate(list(raw.geometry.values())) if hasattr(raw, "geometry") else raw
+        m = o3d.geometry.TriangleMesh()
+        m.vertices  = o3d.utility.Vector3dVector(np.array(tm.vertices,  dtype=np.float64))
+        m.triangles = o3d.utility.Vector3iVector(np.array(tm.faces,     dtype=np.int32))
+        if hasattr(tm.visual, "uv") and tm.visual.uv is not None:
+            idx = np.array(tm.faces, dtype=np.int32)
+            m.triangle_uvs = o3d.utility.Vector2dVector(np.array(tm.visual.uv, dtype=np.float64)[idx.ravel()])
+            mat = tm.visual.material
+            if hasattr(mat, "baseColorTexture") and mat.baseColorTexture is not None:
+                m.textures = [o3d.geometry.Image(np.array(mat.baseColorTexture.convert("RGB"), dtype=np.uint8))]
+                m.triangle_material_ids = o3d.utility.IntVector(np.zeros(len(tm.faces), dtype=np.int32))
+        m.compute_vertex_normals()
+        return m
+    elif ext == ".usdz":
+        from pxr import Usd, UsdGeom
+        stage = Usd.Stage.Open(path)
+        verts_all, faces_all, uvs_all, off = [], [], [], 0
+        for prim in stage.Traverse():
+            if prim.GetTypeName() != "Mesh": continue
+            um = UsdGeom.Mesh(prim)
+            pts  = np.array(um.GetPointsAttr().Get(), dtype=np.float64)
+            fidx = np.array(um.GetFaceVertexIndicesAttr().Get(), dtype=np.int32)
+            verts_all.append(pts); faces_all.append(fidx.reshape(-1, 3) + off); off += len(pts)
+            st = UsdGeom.PrimvarsAPI(prim).GetPrimvar("st")
+            if st and st.IsDefined():
+                uv_vals = np.array(st.Get(), dtype=np.float64)
+                uv_idx  = st.GetIndices()
+                uvs_all.append((uv_vals[np.array(uv_idx, dtype=np.int32)] if uv_idx is not None and len(uv_idx) else uv_vals).reshape(-1, 2))
+        m = o3d.geometry.TriangleMesh()
+        all_v = np.concatenate(verts_all); all_f = np.concatenate(faces_all)
+        m.vertices  = o3d.utility.Vector3dVector(all_v)
+        m.triangles = o3d.utility.Vector3iVector(all_f)
+        if uvs_all:
+            all_uv = np.concatenate(uvs_all)
+            if len(all_uv) == len(all_f) * 3:
+                m.triangle_uvs = o3d.utility.Vector2dVector(all_uv)
+                with zipfile.ZipFile(path) as z:
+                    cands = [n for n in z.namelist() if n.lower().endswith(("_tex0.png", "_tex0.jpg"))] \
+                         or [n for n in z.namelist() if n.lower().endswith(".png")]
+                    if cands:
+                        with tempfile.TemporaryDirectory() as tmp:
+                            z.extract(cands[0], tmp)
+                            img = Image.open(os.path.join(tmp, cands[0])).convert("RGB")
+                            m.textures = [o3d.geometry.Image(np.array(img, dtype=np.uint8))]
+                            m.triangle_material_ids = o3d.utility.IntVector(np.zeros(len(all_f), dtype=np.int32))
+        m.compute_vertex_normals()
+        return m
+    else:
+        raise ValueError(f"Unsupported format: {ext}")
 
 
 def create_debug_texture(width=2048, height=2048, grid_size=20):
@@ -10,30 +68,26 @@ def create_debug_texture(width=2048, height=2048, grid_size=20):
     draw = ImageDraw.Draw(img)
     cell_w = width / grid_size
     cell_h = height / grid_size
-    
+
     try:
         font = ImageFont.truetype("arial.ttf", int(min(cell_w, cell_h) * 0.3))
     except Exception:
         font = ImageFont.load_default()
-        
+
     for i in range(grid_size):
         for j in range(grid_size):
             x0 = j * cell_w
             y0 = i * cell_h
             x1 = x0 + cell_w
             y1 = y0 + cell_h
-            
             r = int(255 * (j / grid_size))
             g = int(255 * (i / grid_size))
             b = 150
             bg_color = (r, g, b)
-            
             draw.rectangle([x0, y0, x1, y1], fill=bg_color, outline="black")
-            
             text = f"{i},{j}"
             draw.text((x0 + cell_w*0.1, y0 + cell_h*0.1), text, fill="white", font=font)
             draw.text((x0 + cell_w*0.1 + 2, y0 + cell_h*0.1 + 2), text, fill="black", font=font)
-            
     return img
 
 
@@ -76,6 +130,19 @@ def normalize_orientation(pcd, up_axis="Y"):
 def remove_outliers(pcd, nb=20, std=2.0):
     cl, _ = pcd.remove_statistical_outlier(nb_neighbors=nb, std_ratio=std)
     return cl
+
+
+def compute_scale_metric(pcd, method="median_radius"):
+    pts = np.asarray(pcd.points)
+    if method == "aabb_diag":
+        bb = pcd.get_axis_aligned_bounding_box()
+        return float(np.linalg.norm(bb.get_extent()))
+    elif method == "median_radius":
+        c = pts.mean(axis=0)
+        d = np.linalg.norm(pts - c, axis=1)
+        return float(np.median(d))
+    else:
+        raise ValueError(method)
 
 
 def preprocess(pcd, voxel_size):
@@ -161,7 +228,7 @@ def parameterize_mesh_xatlas(mesh):
     uv_flat = new_uvs[new_triangles].reshape(-1, 2)
     new_mesh.triangle_uvs = o3d.utility.Vector2dVector(uv_flat)
     new_mesh.compute_vertex_normals()
-    
+
     if mesh.has_vertex_colors():
         old_colors = np.asarray(mesh.vertex_colors)
         new_colors = old_colors[vmapping]
@@ -172,7 +239,7 @@ def parameterize_mesh_xatlas(mesh):
 
 def bake_digital_texture(mesh_digital, mesh_scan, tex_path, out_size=4096, max_dist=0.05):
     print(f"Baking high-res texture ({out_size}x{out_size}) for digital model...")
-    tex_img = Image.open(tex_path).convert("RGB")
+    tex_img = (tex_path if isinstance(tex_path, Image.Image) else Image.open(tex_path)).convert("RGB")
     tex_w, tex_h = tex_img.size
     tex_arr = np.array(tex_img).astype(np.float32) / 255.0
 
@@ -308,11 +375,98 @@ def show(window_data):
         vis.destroy_window()
 
 
+def _d2_hist(pcd, n_samples=4000, n_pairs=200_000, n_bins=64, max_ratio=4.0):
+    pts = np.asarray(pcd.points)
+    if len(pts) > n_samples:
+        idx = np.random.default_rng(0).choice(len(pts), n_samples, replace=False); pts = pts[idx]
+    rng = np.random.default_rng(1)
+    i = rng.integers(0, len(pts), n_pairs); j = rng.integers(0, len(pts), n_pairs)
+    mask = i != j; i, j = i[mask], j[mask]
+    d = np.linalg.norm(pts[i] - pts[j], axis=1); med = np.median(d)
+    if med < 1e-12: return np.zeros(n_bins)
+    hist, _ = np.histogram(d / med, bins=n_bins, range=(0.0, max_ratio), density=True)
+    s = hist.sum()
+    return hist / s if s > 0 else hist
+
+
+def compute_volume(pcd):
+    try:
+        hull, _ = pcd.compute_convex_hull()
+        return float(hull.get_volume())
+    except:
+        return 0.0
+
+
+def compute_edge_score(pcd):
+    try:
+        _, idx = pcd.compute_convex_hull()
+        return float(len(idx)) / len(pcd.points)
+    except:
+        return 0.0
+
+
+def compute_scan_descriptors(pcd):
+    pts = np.asarray(pcd.points)
+    ext = np.sort(np.asarray(pcd.get_axis_aligned_bounding_box().get_extent(), float))[::-1]
+    aabb_n = (ext / ext.max()).tolist() if ext.max() > 1e-12 else [1.0, 0.0, 0.0]
+    centered = pts - pts.mean(axis=0)
+    w = np.sort(np.linalg.eigvalsh(np.cov(centered.T)))[::-1]; w = np.clip(w, 1e-18, None)
+    try:
+        hull, _ = pcd.compute_convex_hull(); hull.compute_vertex_normals()
+        v = hull.get_volume(); a = hull.get_surface_area()
+        hull_c = float(v / (a ** 1.5)) if a > 1e-12 else 0.0
+    except Exception:
+        hull_c = 0.0
+    return {
+        "size_median_radius":      compute_scale_metric(pcd, "median_radius"),
+        "aabb_extent_sorted_norm": np.array(aabb_n),
+        "pca_eigenvalue_ratios":   np.array([float(w[1]/w[0]), float(w[2]/w[0])]),
+        "convex_hull_compactness": hull_c,
+        "d2_histogram":            _d2_hist(pcd),
+        "volume":                  compute_volume(pcd),
+        "edge_score":              compute_edge_score(pcd)
+    }
+
+
+def descriptor_distance(scan_desc, idx_data):
+    if idx_data.get("variant") == "vol_edge":
+        vol_dist = abs(scan_desc["volume"] - float(idx_data["volume"]))
+        edge_dist = abs(scan_desc["edge_score"] - float(idx_data["edge_score"]))
+        return float(vol_dist + edge_dist * 100.0)
+
+    w = {"d2": 3.0, "pca": 1.0, "aabb": 1.0, "hull": 0.5, "size": 0.3}
+    a = scan_desc["d2_histogram"]; b = np.asarray(idx_data["d2_histogram"])
+    d2_dist = 0.5 * np.sum(((a - b) ** 2) / (a + b + 1e-12))
+    pca_dist  = np.linalg.norm(scan_desc["pca_eigenvalue_ratios"]   - np.asarray(idx_data["pca_eigenvalue_ratios"]))
+    aabb_dist = np.linalg.norm(scan_desc["aabb_extent_sorted_norm"] - np.asarray(idx_data["aabb_extent_sorted_norm"]))
+    hull_dist = abs(scan_desc["convex_hull_compactness"] - float(idx_data["convex_hull_compactness"]))
+    size_dist = abs(np.log(max(scan_desc["size_median_radius"], 1e-9) / max(float(idx_data["size_median_radius"]), 1e-9)))
+    return float(w["d2"]*d2_dist + w["pca"]*pca_dist + w["aabb"]*aabb_dist + w["hull"]*hull_dist + w["size"]*size_dist)
+
+
+def get_top_candidates(pcd_scan, index_folder, top_k=5):
+    scan_desc = compute_scan_descriptors(pcd_scan)
+    entries = []
+    for f in sorted(glob.glob(os.path.join(index_folder, "*.index.json"))):
+        with open(f, "r") as fp: entries.append(json.load(fp))
+    if not entries:
+        raise SystemExit(f"Keine Indexdateien in {index_folder} – bitte erst index_digital_models.py ausführen.")
+    ranked = sorted(entries, key=lambda d: descriptor_distance(scan_desc, d))
+    print("\nTop candidates (pre-ranking):")
+    out = []
+    for i, d in enumerate(ranked[:top_k]):
+        name = os.path.splitext(d["source_file"])[0]
+        ply_path = os.path.join(index_folder, d["source_file"])
+        print(f"  #{i+1}  {d['source_file']}   dist={descriptor_distance(scan_desc, d):.3f}")
+        out.append((name, ply_path))
+    return out
+
+
 if __name__ == "__main__":
     VOXEL       = 0.005
-    SCAN_OBJ    = "Models/coffee_machine-scanned_result-iphone/coffee_machine-scanned_result-iphone.obj"
+    SCAN_OBJ    = "./scanned and digital models/Scanned-House_Key.glb"
     TEXTURE     = "texture.jpg"
-    DIGITAL_OBJ = "Models/coffee_machine-digital-with_joints.obj"
+    INDEX_FOLDER = "./scanned and digital models/Digital_Models_Cropped"
 
     BAKE_DEBUG_GRID_TO_DIGITAL = False
     SHOW_UV_GRID_ON_DIGITAL = False
@@ -327,30 +481,66 @@ if __name__ == "__main__":
 
     print("Loading point clouds...")
     pcd_scan    = o3d.io.read_point_cloud("cropped_1.ply")
-    pcd_digital = o3d.io.read_point_cloud("cropped_2.ply")
-    print(f"  scan={len(pcd_scan.points):,}  digital={len(pcd_digital.points):,}")
-
-    pcd_digital.scale(0.001, center=np.zeros(3))
     pcd_scan    = remove_outliers(pcd_scan)
-    pcd_digital = remove_outliers(pcd_digital)
+    print(f"  scan={len(pcd_scan.points):,}")
 
-    print("Normalizing axes...")
-    pcd_scan_n,    T_scan_n    = normalize_orientation(pcd_scan,    up_axis="Y")
-    pcd_digital_n, T_digital_n = normalize_orientation(pcd_digital, up_axis="-Z")
+    print("Pre-ranking digital models from index...")
+    candidates = get_top_candidates(pcd_scan, INDEX_FOLDER, top_k=5)
 
-    print(f"Preprocessing  voxel={VOXEL}...")
-    scan_down    = preprocess(pcd_scan_n,    VOXEL)
-    digital_down = preprocess(pcd_digital_n, VOXEL)
-    print(f"  scan={len(scan_down.points):,}  digital={len(digital_down.points):,}")
+    winner = None  
+    for cand_name, cand_ply in candidates:
+        print(f"\n========== Candidate: {cand_name} ==========")
+        pcd_digital = o3d.io.read_point_cloud(cand_ply)
+        print(f"  digital={len(pcd_digital.points):,}")
 
-    best = find_best_registration(scan_down, digital_down, VOXEL)
+        pcd_digital.scale(0.001, center=np.zeros(3))
+        pcd_digital_c = remove_outliers(pcd_digital)
+
+        print("Auto-scaling digital cloud to match scan size...")
+        size_scan    = compute_scale_metric(pcd_scan,    "median_radius")
+        size_digital = compute_scale_metric(pcd_digital_c, "median_radius")
+        auto_scale   = size_scan / max(size_digital, 1e-12)
+        print(f"  size_scan={size_scan:.4f}  size_digital={size_digital:.4f}  factor={auto_scale:.4f}")
+        pcd_digital_c.scale(auto_scale, center=np.zeros(3))
+
+        print("Normalizing axes...")
+        pcd_scan_n,    T_scan_n    = normalize_orientation(pcd_scan,    up_axis="Y")
+        pcd_digital_n, T_digital_n = normalize_orientation(pcd_digital_c, up_axis="-Z")
+
+        print(f"Preprocessing  voxel={VOXEL}...")
+        scan_down    = preprocess(pcd_scan_n,    VOXEL)
+        digital_down = preprocess(pcd_digital_n, VOXEL)
+        print(f"  scan={len(scan_down.points):,}  digital={len(digital_down.points):,}")
+
+        best = find_best_registration(scan_down, digital_down, VOXEL)
+        sc = best.score()
+        print(f"  -> score {cand_name}: {sc:.2f}")
+        if winner is None or sc > winner[0]:
+            winner = (sc, best, cand_name, cand_ply, auto_scale,
+                      T_scan_n, T_digital_n, scan_down, digital_down, pcd_digital_c)
+
+    if winner is None:
+        raise SystemExit("Kein Kandidat lieferte eine Registrierung.")
+
+    (_, best, _dig_base, _dig_ply, auto_scale,
+     T_scan_n, T_digital_n, scan_down, digital_down, pcd_digital) = winner
+    print(f"\n>>> Auto-selected: {_dig_base}  {best}\n")
+
+    DIGITAL_OBJ = os.path.join(os.path.dirname(_dig_ply), _dig_base + ".obj")
+    if not os.path.exists(DIGITAL_OBJ):
+        alt = os.path.join(os.path.dirname(INDEX_FOLDER.rstrip("/\\")), _dig_base + ".obj")
+        if os.path.exists(alt): DIGITAL_OBJ = alt
 
     T_align = best.transformation @ T_scan_n
 
     print("Loading meshes...")
-    mesh_scan    = o3d.io.read_triangle_mesh(SCAN_OBJ,    enable_post_processing=True)
-    mesh_digital = o3d.io.read_triangle_mesh(DIGITAL_OBJ, enable_post_processing=True)
+    mesh_scan    = load_mesh(SCAN_OBJ)
+    mesh_digital = load_mesh(DIGITAL_OBJ)
     mesh_digital.scale(0.001, center=np.zeros(3))
+    mesh_digital.scale(auto_scale, center=np.zeros(3))  
+
+    if mesh_scan.has_textures():
+        TEXTURE = Image.fromarray(np.asarray(mesh_scan.textures[0]))
 
     mesh_scan_aligned    = copy.deepcopy(mesh_scan);    mesh_scan_aligned.transform(T_align)
     mesh_digital_aligned = copy.deepcopy(mesh_digital); mesh_digital_aligned.transform(T_digital_n)
@@ -376,33 +566,47 @@ if __name__ == "__main__":
 
     print("Baking texture to digital model UVs...")
     digital_tex_img = bake_digital_texture(mesh_digital_aligned, mesh_scan_aligned, TEXTURE)
-    
+
     if digital_tex_img is not None:
-        digital_tex_img.save("digital_texture.jpg")
-        print("Saved digital_texture.jpg")
-        
+        base_name = os.path.splitext(os.path.basename(DIGITAL_OBJ))[0]
+        out_tex_name = f"{base_name}_texture.jpg"
+
+        digital_tex_img.save(out_tex_name)
+        print(f"Saved {out_tex_name}")
+
         mesh_digital_aligned.textures = [o3d.geometry.Image(np.asarray(digital_tex_img))]
         mesh_digital_aligned.triangle_material_ids = o3d.utility.IntVector(np.zeros(len(mesh_digital_aligned.triangles), dtype=np.int32))
-        
-        T_digital_n_inv = np.linalg.inv(T_digital_n)
-        mesh_digital_aligned.transform(T_digital_n_inv)
-        mesh_digital_aligned.scale(1000.0, center=np.zeros(3))
 
-        out_obj_path = "coffee_machine_digital_textured.obj"
+        T_digital_n_inv = np.linalg.inv(T_digital_n)
+
+        T_digital_n_inv = np.linalg.inv(T_digital_n).copy()
+        T_digital_n_inv[:3, 3] *= 1000.0
+        aabb = mesh_digital_aligned.get_axis_aligned_bounding_box()
+        center = aabb.get_center()
+        min_y  = aabb.min_bound[1]
+
+        T_place = np.eye(4)
+        T_place[0, 3] = -center[0]
+        T_place[2, 3] = -center[2]
+        T_place[1, 3] = -min_y
+        mesh_digital_aligned.transform(T_place)
+
+        out_obj_path = f"{base_name}_textured.obj"
         o3d.io.write_triangle_mesh(out_obj_path, mesh_digital_aligned, write_triangle_uvs=True)
         print(f"Saved {out_obj_path} (restored to original digital model orientation)")
 
-        out_mtl_path = "coffee_machine_digital_textured.mtl"
+        out_mtl_path = f"{base_name}_textured.mtl"
+        auto_tex = f"{base_name}_textured_0.png"
         try:
             with open(out_mtl_path, "r") as f:
                 mtl_content = f.read()
-            mtl_content = mtl_content.replace("coffee_machine_digital_textured_0.png", "digital_texture.jpg")
+            mtl_content = mtl_content.replace(auto_tex, out_tex_name)
             with open(out_mtl_path, "w") as f:
                 f.write(mtl_content)
             import os
-            if os.path.exists("coffee_machine_digital_textured_0.png"):
-                os.remove("coffee_machine_digital_textured_0.png")
-            print("Updated MTL to reference digital_texture.jpg")
+            if os.path.exists(auto_tex):
+                os.remove(auto_tex)
+            print(f"Updated MTL to reference {out_tex_name}")
         except Exception as e:
             print(f"Could not update MTL file: {e}")
 
