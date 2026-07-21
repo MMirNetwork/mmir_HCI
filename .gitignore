@@ -1,10 +1,11 @@
 *
 !*/
 
+
 !Models/
 !Models/**/
-
-
+!Server Files - scan pipeline/
+!Server Files - scan pipeline/**
 !index_digital_models.py
 
 !.gitignore

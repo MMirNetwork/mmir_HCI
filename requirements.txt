@@ -3,3 +3,4 @@ numpy
 Pillow
 xatlas
 opencv-python
+matplotlib
